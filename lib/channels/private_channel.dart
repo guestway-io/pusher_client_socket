@@ -8,10 +8,7 @@ import 'channel.dart';
 
 /// Represents a private channel in Pusher.
 class PrivateChannel extends Channel {
-  PrivateChannel({
-    required super.client,
-    required super.name,
-  }) {
+  PrivateChannel({required super.client, required super.name}) {
     onSubscriptionSuccess(_onSubscriptionSuccess);
     onSubscriptionCount(_onSubscriptionCount);
   }
@@ -26,9 +23,7 @@ class PrivateChannel extends Channel {
   /// Subscribes to the private channel.
   @override
   void subscribe([bool force = false]) async {
-    if (!client.connected ||
-        (subscribed && !force) ||
-        client.socketId == null) {
+    if (!client.connected || (subscribed && !force) || client.socketId == null) {
       return;
     }
 
@@ -36,51 +31,31 @@ class PrivateChannel extends Channel {
 
     options.log("SUBSCRIBE", name);
 
-    final payload = {
-      "channel_name": name,
-      "socket_id": client.socketId,
-    };
+    final payload = {"channel_name": name, "socket_id": client.socketId};
 
-    final response = await http.post(
-      Uri.parse(authOptions.endpoint),
-      body: payload,
-      headers: authOptions.headers,
-    );
+    final authOptionsHeaders = authOptions.headersAsync != null ? await authOptions.headersAsync!() : authOptions.headers;
 
-    options.log(
-      "AUTH_RESPONSE",
-      name,
-      "options: $authOptions\n  payload: $payload\n  response: ${response.body}",
-    );
+    final response = await http.post(Uri.parse(authOptions.endpoint), body: payload, headers: authOptionsHeaders);
+
+    options.log("AUTH_RESPONSE", name, "options: $authOptions\n  payload: $payload\n  response: ${response.body}");
 
     if (response.statusCode == 200) {
       // try {
       final data = jsonDecode(response.body);
 
       if (data is! Map) {
-        throw Exception(
-          "Invalid auth response data [$data], excepted Map got ${data.runtimeType}",
-        );
+        throw Exception("Invalid auth response data [$data], excepted Map got ${data.runtimeType}");
       } else if (!data.containsKey("auth")) {
-        throw Exception(
-          "Invalid auth response data [$data], auth key is missing",
-        );
+        throw Exception("Invalid auth response data [$data], auth key is missing");
       }
       authData = AuthData.fromJson(data);
       userId = authData!.channelData?.userId;
-      client.sendEvent("pusher:subscribe", {
-        "channel": name,
-        "auth": authData!.auth,
-        "channel_data": authData!.channelData?.toJsonString(),
-      });
+      client.sendEvent("pusher:subscribe", {"channel": name, "auth": authData!.auth, "channel_data": authData!.channelData?.toJsonString()});
       // } catch (e) {
       //   handleEvent("pusher:error", e);
       // }
     } else {
-      handleEvent(
-        "pusher:error",
-        "Unable to authenticate channel $name, status code: ${response.statusCode}",
-      );
+      handleEvent("pusher:error", "Unable to authenticate channel $name, status code: ${response.statusCode}");
     }
   }
 
@@ -102,8 +77,7 @@ class PrivateChannel extends Channel {
   }
 
   /// Binding for the subscription count event.
-  void onSubscriptionCount(Function listener) =>
-      bind("pusher:subscription_count", listener);
+  void onSubscriptionCount(Function listener) => bind("pusher:subscription_count", listener);
 
   /// Send an event to the channel.
   void trigger(String event, [data]) {

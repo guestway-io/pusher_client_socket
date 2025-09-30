@@ -12,9 +12,10 @@ import 'package:web_socket_client/web_socket_client.dart';
 
 import 'src/options.dart';
 
+export 'package:web_socket_client/src/connection_state.dart';
+
 export 'channels/channel.dart';
 export 'src/options.dart';
-export 'package:web_socket_client/src/connection_state.dart';
 
 /// Represents a client for connecting to a Pusher server.
 class PusherClient {
@@ -66,10 +67,7 @@ class PusherClient {
 
     _socket.connection.listen(_onConnectionStateChange);
 
-    _socket.messages.listen(
-      _onMessageReceived,
-      onError: (err) => _onEvent('error', err),
-    );
+    _socket.messages.listen(_onMessageReceived, onError: (err) => _onEvent('error', err));
   }
 
   /// Disconnects the client from the server.
@@ -90,11 +88,7 @@ class PusherClient {
       const Disconnected(): 'DISCONNECTED',
     };
 
-    options.log(
-      "CONNECTION_STATE_CHANGED",
-      null,
-      "the connection state changed from ${states[_connectionState]} to ${states[state]}",
-    );
+    options.log("CONNECTION_STATE_CHANGED", null, "the connection state changed from ${states[_connectionState]} to ${states[state]}");
     _connectionState = state;
 
     /// Check if the client is connected (fixed by @usmanabdulmajid)
@@ -175,21 +169,15 @@ class PusherClient {
 
     sendEvent("pusher:ping", null);
 
-    _activityTimer = Timer.periodic(
-      Duration(milliseconds: options.pongTimeout),
-      (timer) {
-        _onEvent("pusher:error", "Activity timeout");
-        disconnect(null, "Activity timeout");
-      },
-    );
+    _activityTimer = Timer.periodic(Duration(milliseconds: options.pongTimeout), (timer) {
+      _onEvent("pusher:error", "Activity timeout");
+      disconnect(null, "Activity timeout");
+    });
   }
 
   void _resetActivityCheck() {
     _stopActivityTimer();
-    _activityTimer = Timer.periodic(
-      Duration(milliseconds: options.activityTimeout),
-      (timer) => _sendActivityCheck(),
-    );
+    _activityTimer = Timer.periodic(Duration(milliseconds: options.activityTimeout), (timer) => _sendActivityCheck());
   }
 
   void _stopActivityTimer() {
@@ -211,10 +199,7 @@ class PusherClient {
 
     if (event is Map) {
       if (event.containsKey('event')) {
-        String eventName = event['event'].replaceAll(
-          'pusher_internal:',
-          'pusher:',
-        );
+        String eventName = event['event'].replaceAll('pusher_internal:', 'pusher:');
         dynamic data = event['data'];
 
         if (data is String) {
@@ -228,9 +213,7 @@ class PusherClient {
         throw Exception('Invalid event "$event", messing event name');
       }
     } else {
-      throw Exception(
-        'Invalid event "$event", the event must be map but ${event.runtimeType} given',
-      );
+      throw Exception('Invalid event "$event", the event must be map but ${event.runtimeType} given');
     }
   }
 
@@ -252,18 +235,11 @@ class PusherClient {
   /// Send an event to the server.
   void sendEvent(String event, [dynamic data, String? channel]) {
     options.log("SEND_EVENT", null, "event: $event\n  data: $data");
-    _socket.send(
-      jsonEncode({
-        "event": event,
-        "data": data,
-        if (channel != null) "channel": channel,
-      }),
-    );
+    _socket.send(jsonEncode({"event": event, "data": data, if (channel != null) "channel": channel}));
   }
 
   /// Binding to the connection state change event.
-  void onConnectionStateChange(Function(ConnectionState) listener) =>
-      bind("connection_state_changed", listener);
+  void onConnectionStateChange(Function(ConnectionState) listener) => bind("connection_state_changed", listener);
 
   /// Binding to the connection state change event.
   void onConnecting(Function listener) => bind('connecting', listener);
@@ -272,8 +248,7 @@ class PusherClient {
   void onConnected(Function listener) => bind('connected', listener);
 
   /// Binding to the connection state change event.
-  void onConnectionEstablished(Function listener) =>
-      bind("pusher:connection_established", listener);
+  void onConnectionEstablished(Function listener) => bind("pusher:connection_established", listener);
 
   /// Binding to the connection state change event.
   void onReconnecting(Function listener) => bind('reconnecting', listener);
@@ -288,57 +263,37 @@ class PusherClient {
   void onDisconnected(Function listener) => bind('disconnected', listener);
 
   /// Binding to the connection state change event.
-  void onConnectionError(Function(dynamic error) listener) =>
-      bind('connection_error', listener);
+  void onConnectionError(Function(dynamic error) listener) => bind('connection_error', listener);
 
   /// Binding to the connection state change event.
-  void onError(Function(dynamic error) listener) =>
-      bind('pusher:error', listener);
+  void onError(Function(dynamic error) listener) => bind('pusher:error', listener);
 
   @internal
   late final channelsCollection = ChannelsCollection(this);
 
   /// Returns a channel by name.
-  T channel<T extends Channel>(String channelName, {bool subscribe = false}) =>
-      channelsCollection.channel<T>(channelName, subscribe: subscribe);
+  T channel<T extends Channel>(String channelName, {bool subscribe = false}) => channelsCollection.channel<T>(channelName, subscribe: subscribe);
 
   /// Returns a private channel by name.
-  PrivateChannel private(String channelName, {bool subscribe = false}) =>
-      channel(
-        channelName.startsWith("private-")
-            ? channelName
-            : "private-$channelName",
-        subscribe: subscribe,
-      );
+  PrivateChannel private(String channelName, {bool subscribe = false}) => channel(channelName.startsWith("private-") ? channelName : "private-$channelName", subscribe: subscribe);
 
   /// Returns a private encrypted channel by name.
-  PrivateChannel privateEncrypted(
-    String channelName, {
-    bool subscribe = false,
-  }) => channel(
-    channelName.startsWith("private-encrypted-")
-        ? channelName
-        : "private-encrypted-$channelName",
-    subscribe: subscribe,
-  );
+  PrivateChannel privateEncrypted(String channelName, {bool subscribe = false}) =>
+      channel(channelName.startsWith("private-encrypted-") ? channelName : "private-encrypted-$channelName", subscribe: subscribe);
 
   /// Returns a presence channel by name.
   PresenceChannel presence(String channelName, {bool subscribe = false}) =>
-      channel(
-        channelName.startsWith("presence-")
-            ? channelName
-            : "presence-$channelName",
-        subscribe: subscribe,
-      );
+      channel(channelName.startsWith("presence-") ? channelName : "presence-$channelName", subscribe: subscribe);
 
   /// Subscribes to a channel by name.
-  T subscribe<T extends Channel>(String channelName) =>
-      channel<T>(channelName, subscribe: true);
+  T subscribe<T extends Channel>(String channelName) => channel<T>(channelName, subscribe: true);
 
   /// Unsubscribes from a channel by name.
   void unsubscribe(String channelName) => channel(channelName).unsubscribe();
 
+  /// Unsubscribes from all channels and clears the collection.
+  void unsubscribeAllClearChannels() => channelsCollection.clear();
+
   /// Re-subscribes to all channels.
-  void _reSubscribe() =>
-      channelsCollection.forEach((channel) => channel.subscribe(true));
+  void _reSubscribe() => channelsCollection.forEach((channel) => channel.subscribe(true));
 }
