@@ -46,11 +46,27 @@ class PusherOptions {
   /// Whether to auto connect or not.
   final bool autoConnect;
 
-  /// The maximum reconnection attempts.
-  final int maxReconnectionAttempts;
+  /// How many times in a row the client re-creates its connection without
+  /// reaching the server before it gives up (default: `null`, never give up).
+  ///
+  /// It only counts the connections the client re-creates itself (after its
+  /// own activity timeout, a 4100-4199 close code, or once web_socket_client
+  /// stopped its own reconnection attempts), and starts over at every
+  /// successful `pusher:connection_established`.
+  final int? maxReconnectionAttempts;
 
-  /// The reconnection duration.
+  /// No longer used: the client reconnects with a capped, jittered exponential
+  /// backoff between [minReconnectDelay] and [maxReconnectDelay].
+  @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.')
   final Duration reconnectGap;
+
+  /// The base delay before the first reconnection attempt (default: 1 second).
+  /// Each failed attempt doubles it, up to [maxReconnectDelay], and every delay
+  /// is jittered between half and all of that value.
+  final Duration minReconnectDelay;
+
+  /// The longest delay between two reconnection attempts (default: 30 seconds).
+  final Duration maxReconnectDelay;
 
   /// The channel decryption handler.
   final Map<String, dynamic> Function(
@@ -76,8 +92,10 @@ class PusherOptions {
     required this.authOptions,
     this.enableLogging = false,
     this.autoConnect = true,
-    this.maxReconnectionAttempts = 6,
-    this.reconnectGap = const Duration(seconds: 2),
+    this.maxReconnectionAttempts,
+    @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.') this.reconnectGap = const Duration(seconds: 2),
+    this.minReconnectDelay = const Duration(seconds: 1),
+    this.maxReconnectDelay = const Duration(seconds: 30),
     this.channelDecryption,
   });
 
@@ -99,7 +117,7 @@ class PusherOptions {
       host: hostUri?.host.isNotEmpty == true
           ? hostUri!.host
           : (cluster != null ? 'ws-$cluster.pusher.com' : 'ws.pusher.com'),
-      port: hostUri?.port == 0 ? (encrypted ? wssPort : wsPort) : uri.port,
+      port: hostUri == null || hostUri.port == 0 ? (encrypted ? wssPort : wsPort) : hostUri.port,
       queryParameters: {
         ...parameters,
         if (hostUri?.query.isNotEmpty == true) ...hostUri!.queryParameters,

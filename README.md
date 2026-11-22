@@ -8,7 +8,7 @@ A Dart library for connecting to a Pusher server using WebSockets. This library 
 - Available for all platforms (Android, IOS, MacOS, WindowsOS, LinuxOS, Web).
 - Subscribe to public, private, private encrypted, and presence channels.
 - Bind event listeners to handle custom and Pusher-specific events.
-- Automatic reconnection logic for handling connection interruptions.
+- Automatic reconnection logic for handling connection interruptions: until `disconnect()` is called, the client reconnects after connection errors, lost connections, any close code but 4000-4099 (which the Pusher protocol reserves for connections that must not be retried) and its own activity timeout, with a capped, jittered exponential backoff, and re-subscribes its channels.
 - Activity check mechanism to ensure the connection remains active.
 
 ## Installation
@@ -170,8 +170,10 @@ channel.unsubscribe();
 | `authOptions`             | `PusherAuthOptions`                                                                 | The options for authentication, such as headers or credentials. This is required for authenticating private and presence channels.               |
 | `enableLogging`           | `bool`                                                                              | A flag indicating whether to enable logging for the Pusher client. Default is `false`.                                                           |
 | `autoConnect`             | `bool`                                                                              | A flag indicating whether to automatically connect to the Pusher server upon initialization. Default is `true`.                                  |
-| `maxReconnectionAttempts` | `int`                                                                               | The maximum reconnection attempts.                                                                                                               |
-| `reconnectGap`            | `Duration`                                                                          | The reconnection duration gap.                                                                                                                   |
+| `maxReconnectionAttempts` | `int?`                                                                              | How many times in a row the client re-creates its connection without reaching the server before giving up. Default is `null` (never give up).    |
+| `minReconnectDelay`       | `Duration`                                                                          | The base delay before the first reconnection attempt, doubled after each failed attempt and jittered. Default is 1 second.                       |
+| `maxReconnectDelay`       | `Duration`                                                                          | The longest delay between two reconnection attempts. Default is 30 seconds.                                                                      |
+| `reconnectGap`            | `Duration`                                                                          | Deprecated and ignored: use `minReconnectDelay` and `maxReconnectDelay`.                                                                         |
 | `channelDecryption`       | `Map<String, dynamic> Function(Uint8List sharedSecret, Map<String, dynamic> data)?` | A custom handler for decrypting data on encrypted channels. If not provided, the default decryption handler is used.                             |
 
 ## Pusher Auth Options

@@ -70,3 +70,11 @@
 ## 0.0.5 - 2025-03-27
 
 - Upgrade flutter sdk version.
+
+## 0.0.6 - 2026-11-22
+
+- Never stop reconnecting unless `disconnect()` was called: after a connection error (not only a `SocketException`, also an HTTP 502/503 on the upgrade), after web_socket_client gave up its own reconnection attempts, and after the client's own activity timeout.
+- Follow the Pusher close codes: 4000-4099 stop reconnecting, 4100-4199 reconnect after backing off, any other code reconnects.
+- Reconnect with a capped, jittered exponential backoff: add `minReconnectDelay` (default 1 s) and `maxReconnectDelay` (default 30 s); `reconnectGap` is deprecated and ignored; `maxReconnectionAttempts` defaults to `null` (never give up).
+- `disconnect()` and `sendEvent()` no longer throw when the client has no connection.
+- Fix `PusherOptions.uri` recursing forever for a host with an explicit port (or no host).
