@@ -46,13 +46,10 @@ class PusherOptions {
   /// Whether to auto connect or not.
   final bool autoConnect;
 
-  /// How many times in a row the client re-creates its connection without
-  /// reaching the server before it gives up (default: `null`, never give up).
-  ///
-  /// It only counts the connections the client re-creates itself (after its
-  /// own activity timeout, a 4100-4199 close code, or once web_socket_client
-  /// stopped its own reconnection attempts), and starts over at every
-  /// successful `pusher:connection_established`.
+  /// How many reconnection attempts in a row may fail before the client gives
+  /// up (default: `null`, never give up). An attempt only counts as successful
+  /// once its connection stayed up for a while after
+  /// `pusher:connection_established`.
   final int? maxReconnectionAttempts;
 
   /// No longer used: the client reconnects with a capped, jittered exponential
@@ -60,13 +57,18 @@ class PusherOptions {
   @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.')
   final Duration reconnectGap;
 
-  /// The base delay before the first reconnection attempt (default: 1 second).
-  /// Each failed attempt doubles it, up to [maxReconnectDelay], and every delay
-  /// is jittered between half and all of that value.
+  /// The base reconnection delay (default: 1 second). The first attempt after
+  /// a healthy connection waits a random delay up to twice this; each failed
+  /// attempt after that doubles it, up to [maxReconnectDelay], jittered
+  /// between half and all of that value.
   final Duration minReconnectDelay;
 
   /// The longest delay between two reconnection attempts (default: 30 seconds).
   final Duration maxReconnectDelay;
+
+  /// How long a connection attempt may take before it counts as failed
+  /// (default: 30 seconds).
+  final Duration connectTimeout;
 
   /// The channel decryption handler.
   final Map<String, dynamic> Function(
@@ -96,6 +98,7 @@ class PusherOptions {
     @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.') this.reconnectGap = const Duration(seconds: 2),
     this.minReconnectDelay = const Duration(seconds: 1),
     this.maxReconnectDelay = const Duration(seconds: 30),
+    this.connectTimeout = const Duration(seconds: 30),
     this.channelDecryption,
   });
 

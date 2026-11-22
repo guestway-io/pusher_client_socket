@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:meta/meta.dart';
 
 import '../src/events_listeners.collection.dart';
+import '../src/reconnect.dart';
 import '../pusher_client_socket.dart';
 
 export 'private_channel.dart';
@@ -15,7 +18,10 @@ class Channel {
   /// The name of the channel.
   final String name;
 
-  Channel({required this.client, required this.name});
+  Channel({required this.client, required this.name}) {
+    bind("pusher:subscription_succeeded", _onSubscriptionSucceeded);
+    bind("pusher:subscription_error", _onSubscriptionError);
+  }
 
   /// The options of the client.
   PusherOptions get options => client.options;
@@ -47,6 +53,7 @@ class Channel {
       return;
     }
 
+    cancelSubscribeRetry();
     _subscribed = false;
 
     options.log("SUBSCRIBE", name);
@@ -74,6 +81,8 @@ class Channel {
 
   /// Unsubscribes from the channel.
   void unsubscribe() {
+    cancelSubscribeRetry();
+
     client.sendEvent("pusher:unsubscribe", {"channel": name});
 
     _subscribed = false;
@@ -84,4 +93,60 @@ class Channel {
   /// Binding for the subscription success event.
   void onSubscriptionSuccess(Function listener) =>
       bind("pusher:subscription_succeeded", listener);
+
+  /// Binding for the subscription error event: the auth request failed, or
+  /// the server refused the subscription. The channel retries by itself while
+  /// the connection lasts, and the next connection subscribes again anyway.
+  void onSubscriptionError(Function listener) =>
+      bind("pusher:subscription_error", listener);
+
+  Timer? _subscribeRetryTimer;
+
+  late final ReconnectBackoff _subscribeRetryBackoff = ReconnectBackoff(
+    minDelay: options.minReconnectDelay,
+    maxDelay: options.maxReconnectDelay,
+  );
+
+  void _onSubscriptionSucceeded(dynamic data) {
+    cancelSubscribeRetry();
+    _subscribeRetryBackoff.reset();
+  }
+
+  void _onSubscriptionError(dynamic data) {
+    options.log("SUBSCRIPTION_ERROR", name, "data: $data");
+
+    _subscribed = false;
+    _scheduleSubscribeRetry();
+  }
+
+  /// Subscribes again after a backoff delay, as long as the connection that
+  /// failed is still up and the channel still wanted.
+  void _scheduleSubscribeRetry() {
+    cancelSubscribeRetry();
+
+    final socketId = client.socketId;
+    // Without a connection, the next one subscribes again anyway.
+    if (!client.connected || socketId == null) return;
+
+    final delay = _subscribeRetryBackoff.next(minAttempt: 1);
+    options.log("SUBSCRIBE_RETRY", name, "delay: ${delay.inMilliseconds}ms");
+
+    _subscribeRetryTimer = Timer(delay, () {
+      _subscribeRetryTimer = null;
+      if (client.connected && client.socketId == socketId && !subscribed && isWanted) {
+        subscribe(true);
+      }
+    });
+  }
+
+  /// Cancels a pending subscription retry.
+  @protected
+  void cancelSubscribeRetry() {
+    _subscribeRetryTimer?.cancel();
+    _subscribeRetryTimer = null;
+  }
+
+  /// Whether the client still holds this channel (it wasn't unsubscribed).
+  @protected
+  bool get isWanted => identical(client.channelsCollection.get(name), this);
 }

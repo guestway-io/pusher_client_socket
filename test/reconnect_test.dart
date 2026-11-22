@@ -31,14 +31,27 @@ void main() {
           random: Random(seed),
         );
 
-    test('doubles the delay, jittered between half and all of it, up to the cap', () {
+    test('first attempt: anywhere between 0 and twice the base delay', () {
+      final delays = [for (var seed = 0; seed < 200; seed++) backoff(seed: seed).next().inMilliseconds];
+      expect(delays, everyElement(inInclusiveRange(0, 2000)));
+      expect(delays.where((d) => d < 500), isNotEmpty);
+      expect(delays.where((d) => d > 1500), isNotEmpty);
+    });
+
+    test('then doubles, jittered between half and all of it, up to the cap', () {
       for (var seed = 0; seed < 50; seed++) {
-        final b = backoff(seed: seed);
-        final bases = [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000];
+        final b = backoff(seed: seed)..next();
+        final bases = [2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000];
         for (final base in bases) {
           final delay = b.next().inMilliseconds;
           expect(delay, inInclusiveRange(base ~/ 2, base), reason: 'seed $seed, base $base');
         }
+      }
+    });
+
+    test('minAttempt skips the first steps', () {
+      for (var seed = 0; seed < 50; seed++) {
+        expect(backoff(seed: seed).next(minAttempt: 1).inMilliseconds, inInclusiveRange(1000, 2000));
       }
     });
 
@@ -51,23 +64,20 @@ void main() {
     });
 
     test('jitters: clients that dropped together do not retry together', () {
-      final delays = {for (var seed = 0; seed < 20; seed++) (backoff(seed: seed)..next()).next()};
-      expect(delays.length, greaterThan(10));
+      final delays = {for (var seed = 0; seed < 20; seed++) backoff(seed: seed).next()};
+      expect(delays.length, greaterThan(15));
     });
 
-    test('ignores web_socket_client resets, starts over on restart', () {
+    test('reset starts over', () {
       final b = backoff();
       for (var i = 0; i < 6; i++) {
         b.next();
       }
-
-      b.reset();
-      expect(b.attempt, 6);
       expect(b.next().inMilliseconds, inInclusiveRange(15000, 30000));
 
-      b.restart();
+      b.reset();
       expect(b.attempt, 0);
-      expect(b.next().inMilliseconds, inInclusiveRange(500, 1000));
+      expect(b.next().inMilliseconds, inInclusiveRange(0, 2000));
     });
   });
 }
