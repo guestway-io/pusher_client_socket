@@ -652,14 +652,16 @@ void main() {
     });
 
     test('a lost connection marks channels unsubscribed until subscribed again', () async {
-      final client = makeClient(minReconnectDelay: const Duration(milliseconds: 300))..connect();
+      final client = makeClient()..connect();
       await eventually(() => client.socketId != null);
       final channel = client.private(name, subscribe: true);
       await eventually(() => channel.subscribed);
 
+      bool? subscribedWhenLost;
+      client.onDisconnected((_) => subscribedWhenLost ??= channel.subscribed);
       await server.closeLatest(4200);
-      await eventually(() => !client.connected);
-      expect(channel.subscribed, isFalse);
+      await eventually(() => subscribedWhenLost != null);
+      expect(subscribedWhenLost, isFalse);
 
       await eventually(() => channel.subscribed);
       expect(server.subscribes(name), 2);
