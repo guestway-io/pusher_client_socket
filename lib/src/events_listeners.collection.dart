@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../utils/collection.dart';
 
 /// Represents a collection of events listeners in Pusher.
@@ -21,25 +23,32 @@ class EventsListenersCollection extends Collection<List<Function>> {
   void unbindAll(String event) => remove(event);
 
   /// Handling an event.
+  ///
+  /// A listener that throws doesn't stop the others, nor the client's own
+  /// handling of the event: its error goes to the current zone's error handler.
   void handleEvent(String event, dynamic data, [String? channel]) {
     if (contains(event)) {
-      for (final listener in get(event)!) {
-        if (channel == null) {
-          listener(data);
-        } else {
-          listener(data, channel);
-        }
+      for (final listener in List.of(get(event)!)) {
+        _call(() => channel == null ? listener(data) : listener(data, channel));
       }
     }
 
     if (contains("*")) {
-      for (final listener in get("*")!) {
-        listener({
-          "event": event,
-          "data": data,
-          if (channel != null) "channel": channel,
-        });
+      for (final listener in List.of(get("*")!)) {
+        _call(() => listener({
+              "event": event,
+              "data": data,
+              if (channel != null) "channel": channel,
+            }));
       }
+    }
+  }
+
+  static void _call(void Function() call) {
+    try {
+      call();
+    } catch (error, stackTrace) {
+      Zone.current.handleUncaughtError(error, stackTrace);
     }
   }
 }

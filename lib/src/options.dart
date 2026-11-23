@@ -46,11 +46,38 @@ class PusherOptions {
   /// Whether to auto connect or not.
   final bool autoConnect;
 
-  /// The maximum reconnection attempts.
-  final int maxReconnectionAttempts;
+  /// How many reconnection attempts in a row may fail before the client gives
+  /// up (default: `null`, never give up). An attempt only counts as successful
+  /// once its connection stayed up for a while after
+  /// `pusher:connection_established`.
+  final int? maxReconnectionAttempts;
 
-  /// The reconnection duration.
+  /// No longer used: the client reconnects with a capped, jittered exponential
+  /// backoff between [minReconnectDelay] and [maxReconnectDelay].
+  @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.')
   final Duration reconnectGap;
+
+  /// The base reconnection delay (default: 1 second). The first attempt after
+  /// a healthy connection waits a random delay up to twice this; each failed
+  /// attempt after that doubles it, up to [maxReconnectDelay], jittered
+  /// between half and all of that value.
+  final Duration minReconnectDelay;
+
+  /// The longest delay between two reconnection attempts (default: 30 seconds).
+  final Duration maxReconnectDelay;
+
+  /// How long a connection attempt may take before it counts as failed
+  /// (default: 30 seconds).
+  final Duration connectTimeout;
+
+  /// How long a private channel waits for the server's answer to its
+  /// subscribe before it tries again (default: 20 seconds).
+  final Duration subscriptionTimeout;
+
+  /// How often a private channel retries once its auth request was refused
+  /// with 401/403 several times in a row (default: 5 minutes). Other failures
+  /// are retried with the reconnection backoff.
+  final Duration rejectedAuthRetryDelay;
 
   /// The channel decryption handler.
   final Map<String, dynamic> Function(
@@ -76,8 +103,13 @@ class PusherOptions {
     required this.authOptions,
     this.enableLogging = false,
     this.autoConnect = true,
-    this.maxReconnectionAttempts = 6,
-    this.reconnectGap = const Duration(seconds: 2),
+    this.maxReconnectionAttempts,
+    @Deprecated('Ignored. Use minReconnectDelay and maxReconnectDelay.') this.reconnectGap = const Duration(seconds: 2),
+    this.minReconnectDelay = const Duration(seconds: 1),
+    this.maxReconnectDelay = const Duration(seconds: 30),
+    this.connectTimeout = const Duration(seconds: 30),
+    this.subscriptionTimeout = const Duration(seconds: 20),
+    this.rejectedAuthRetryDelay = const Duration(minutes: 5),
     this.channelDecryption,
   });
 
@@ -99,7 +131,7 @@ class PusherOptions {
       host: hostUri?.host.isNotEmpty == true
           ? hostUri!.host
           : (cluster != null ? 'ws-$cluster.pusher.com' : 'ws.pusher.com'),
-      port: hostUri?.port == 0 ? (encrypted ? wssPort : wsPort) : uri.port,
+      port: hostUri == null || hostUri.port == 0 ? (encrypted ? wssPort : wsPort) : hostUri.port,
       queryParameters: {
         ...parameters,
         if (hostUri?.query.isNotEmpty == true) ...hostUri!.queryParameters,

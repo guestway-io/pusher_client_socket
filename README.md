@@ -8,7 +8,7 @@ A Dart library for connecting to a Pusher server using WebSockets. This library 
 - Available for all platforms (Android, IOS, MacOS, WindowsOS, LinuxOS, Web).
 - Subscribe to public, private, private encrypted, and presence channels.
 - Bind event listeners to handle custom and Pusher-specific events.
-- Automatic reconnection logic for handling connection interruptions.
+- Automatic reconnection logic for handling connection interruptions: until `disconnect()` is called, the client reconnects after connection errors, lost connections, any close code but 4000-4099 (which the Pusher protocol reserves for connections that must not be retried) and its own activity timeout, with a capped, jittered exponential backoff (a connection only counts as healthy once it stayed up for a while), and re-subscribes its channels. A failed private channel subscription (auth error, refused or unanswered subscribe) is retried while the connection lasts. `reconnectNow()` skips the wait (e.g. when the app comes back to the foreground) and `onConnectionReestablished` tells the app it reconnected by itself, so it can refetch what it missed.
 - Activity check mechanism to ensure the connection remains active.
 
 ## Installation
@@ -170,8 +170,13 @@ channel.unsubscribe();
 | `authOptions`             | `PusherAuthOptions`                                                                 | The options for authentication, such as headers or credentials. This is required for authenticating private and presence channels.               |
 | `enableLogging`           | `bool`                                                                              | A flag indicating whether to enable logging for the Pusher client. Default is `false`.                                                           |
 | `autoConnect`             | `bool`                                                                              | A flag indicating whether to automatically connect to the Pusher server upon initialization. Default is `true`.                                  |
-| `maxReconnectionAttempts` | `int`                                                                               | The maximum reconnection attempts.                                                                                                               |
-| `reconnectGap`            | `Duration`                                                                          | The reconnection duration gap.                                                                                                                   |
+| `maxReconnectionAttempts` | `int?`                                                                              | How many times in a row the client re-creates its connection without reaching the server before giving up. Default is `null` (never give up).    |
+| `minReconnectDelay`       | `Duration`                                                                          | The base reconnection delay. The first attempt after a healthy connection waits a random delay up to twice this, each failed attempt doubles it (jittered). Default is 1 second. |
+| `maxReconnectDelay`       | `Duration`                                                                          | The longest delay between two reconnection attempts. Default is 30 seconds.                                                                      |
+| `connectTimeout`          | `Duration`                                                                          | How long a connection attempt may take before it counts as failed. Default is 30 seconds.                                                        |
+| `subscriptionTimeout`     | `Duration`                                                                          | How long a private channel waits for the server to answer its subscribe before it retries. Default is 20 seconds.                                |
+| `rejectedAuthRetryDelay`  | `Duration`                                                                          | How often a private channel retries once its auth request was refused with 401/403 three times in a row. Default is 5 minutes.                  |
+| `reconnectGap`            | `Duration`                                                                          | Deprecated and ignored: use `minReconnectDelay` and `maxReconnectDelay`.                                                                         |
 | `channelDecryption`       | `Map<String, dynamic> Function(Uint8List sharedSecret, Map<String, dynamic> data)?` | A custom handler for decrypting data on encrypted channels. If not provided, the default decryption handler is used.                             |
 
 ## Pusher Auth Options

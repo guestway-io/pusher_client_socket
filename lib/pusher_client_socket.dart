@@ -2,15 +2,18 @@ library pusher_client_socket;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:meta/meta.dart';
 import 'package:pusher_client_socket/channels/channel.dart';
 import 'package:pusher_client_socket/src/channels.collection.dart';
 import 'package:pusher_client_socket/src/events_listeners.collection.dart';
-import 'package:web_socket_client/web_socket_client.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_client/web_socket_client.dart' show ConnectionState, Connecting, Connected, Reconnecting, Reconnected, Disconnecting, Disconnected;
 
 import 'src/options.dart';
+import 'src/dial/dial.dart';
+import 'src/dial/dial_web.dart' if (dart.library.io) 'src/dial/dial_io.dart';
+import 'src/reconnect.dart';
 
 export 'package:web_socket_client/src/connection_state.dart';
 
@@ -18,23 +21,76 @@ export 'channels/channel.dart';
 export 'src/options.dart';
 
 /// Represents a client for connecting to a Pusher server.
+///
+/// Once [connect]ed, the client keeps its connection up until [disconnect] is
+/// called: it reconnects after a connection error, a lost connection, any close
+/// code but 4000-4099 (which the Pusher protocol reserves for connections that
+/// must not be retried) and its own activity timeout, with a jittered
+/// exponential backoff ([PusherOptions.minReconnectDelay],
+/// [PusherOptions.maxReconnectDelay]) that never gives up, and re-subscribes
+/// its channels once connected again.
+///
+/// The client owns every connection attempt: it dials the WebSocket itself
+/// (web_socket_channel) and never has more than one connection open.
 class PusherClient {
   /// The options of the client.
   final PusherOptions options;
 
-  PusherClient({required this.options}) {
-    onConnectionError(_onConnectionError);
+  PusherClient({
+    required this.options,
+    @visibleForTesting WebSocketChannel Function(Uri uri)? channelFactory,
+    @visibleForTesting this.healthyConnectionAfter = const Duration(seconds: 10),
+  }) : _dialer = channelFactory != null ? ((uri, timeout) => _testDial(channelFactory(uri))) : dial {
     onConnectionEstablished(_onConnectionEstablished);
     bind("pusher:ping", _onPing);
-    bind("pusher:pong", (data) {
-      _stopActivityTimer();
-      _resetActivityCheck();
-    });
+    bind("pusher:pong", (data) => _resetActivityCheck());
+    bind("pusher:error", _onServerError);
 
     if (options.autoConnect) connect();
   }
 
-  WebSocket? __socket;
+  static Dial _testDial(WebSocketChannel channel) => Dial(channel, () => channel.sink.close().catchError((_) {}));
+
+  final Dial Function(Uri uri, Duration connectTimeout) _dialer;
+
+  /// How long a connection must stay up after `pusher:connection_established`
+  /// before the backoff starts over. A connection the server accepts and then
+  /// closes right away counts as a failed attempt, so it can't make the client
+  /// reconnect in a tight loop.
+  @visibleForTesting
+  final Duration healthyConnectionAfter;
+
+  /// The current connection attempt or connection, from the moment it is
+  /// dialled.
+  Dial? _dial;
+  StreamSubscription<dynamic>? _channelSubscription;
+
+  /// Bumped whenever the current connection is replaced or closed, and
+  /// checked after every step that can run listener code: what an older
+  /// connection (or an outdated step) does after that is ignored.
+  int _generation = 0;
+
+  /// Whether the client should be connected: set by [connect], cleared by
+  /// [disconnect] and by a close code that forbids reconnecting.
+  bool _keepConnected = false;
+
+  /// Whether the client lost a connection since [connect] (reports
+  /// [Reconnecting] and [Reconnected] instead of [Connecting] and [Connected]).
+  bool _reconnecting = false;
+
+  /// Whether `pusher:connection_established` was received since [connect].
+  bool _establishedSinceConnect = false;
+
+  Timer? _reconnectTimer;
+
+  Timer? _healthyTimer;
+
+  int _reconnectionAttempts = 0;
+
+  late final ReconnectBackoff _backoff = ReconnectBackoff(
+    minDelay: options.minReconnectDelay,
+    maxDelay: options.maxReconnectDelay,
+  );
 
   String? _socketId;
 
@@ -50,111 +106,254 @@ class PusherClient {
   /// Returns the current connection state of the client.
   ConnectionState get connectionState => _connectionState;
 
-  WebSocket get _socket {
-    if (__socket != null) return __socket!;
-    throw Exception("The channel does not initialized yet");
-  }
-
-  /// Connects the client to the server.
+  /// Connects the client to the server, replacing the current connection if any.
   void connect() {
-    /// Close and reset web_socket connection (by @usmanabdulmajid)
-    if (__socket != null) {
-      __socket!.close();
-      __socket = null;
-    }
-
-    __socket = WebSocket(options.uri);
-
-    _socket.connection.listen(_onConnectionStateChange);
-
-    _socket.messages.listen(_onMessageReceived, onError: (err) => _onEvent('error', err));
+    _keepConnected = true;
+    _reconnecting = false;
+    _establishedSinceConnect = false;
+    _cancelReconnect();
+    _reconnectionAttempts = 0;
+    _backoff.reset();
+    _openConnection();
   }
 
-  /// Disconnects the client from the server.
+  /// Disconnects the client from the server. The client doesn't reconnect
+  /// until [connect] is called again.
   void disconnect([int? code, String? reason]) {
     options.log("DISCONNECT", null, "code: $code\n  reason: $reason");
 
-    _socket.close(code, reason);
-    __socket = null;
+    _keepConnected = false;
+    _cancelReconnect();
+    _closeConnection(code, reason);
+    _setState(Disconnected(code: code, reason: reason));
   }
 
-  void _onConnectionStateChange(ConnectionState state) {
-    final states = {
-      const Connecting(): 'CONNECTING',
-      const Connected(): 'CONNECTED',
-      const Reconnecting(): 'RECONNECTING',
-      const Reconnected(): 'RECONNECTED',
-      const Disconnecting(): 'DISCONNECTING',
-      const Disconnected(): 'DISCONNECTED',
-    };
+  /// For when the app comes back to the foreground: if the client is waiting
+  /// to reconnect, it reconnects right away; if it is connected, it pings the
+  /// server now, to find out sooner whether the connection is still alive.
+  /// Does nothing after [disconnect] (or a close code that forbids
+  /// reconnecting), or while a connection attempt is in flight.
+  void reconnectNow() {
+    if (!_keepConnected) return;
 
-    options.log("CONNECTION_STATE_CHANGED", null, "the connection state changed from ${states[_connectionState]} to ${states[state]}");
+    if (_connected) {
+      if (!_awaitingPong) _sendActivityCheck();
+    } else if (_reconnectTimer != null) {
+      options.log("RECONNECT_NOW");
+      _cancelReconnect();
+      _openConnection();
+    }
+  }
+
+  void _openConnection() {
+    _closeConnection();
+    final generation = ++_generation;
+
+    final Dial dialled;
+    try {
+      dialled = _dialer(options.uri, options.connectTimeout);
+    } catch (error, stackTrace) {
+      _setState(_reconnecting ? const Reconnecting() : const Connecting());
+      if (generation == _generation) _onConnectionLost(Disconnected(error: error, stackTrace: stackTrace));
+      return;
+    }
+    _dial = dialled;
+    dialled.channel.ready.ignore();
+
+    _setState(_reconnecting ? const Reconnecting() : const Connecting());
+    if (generation != _generation) return;
+
+    _awaitConnection(dialled, generation);
+  }
+
+  Future<void> _awaitConnection(Dial dialled, int generation) async {
+    final channel = dialled.channel;
+    try {
+      await channel.ready.timeout(options.connectTimeout);
+    } catch (error, stackTrace) {
+      // Also closes a connection that is still being established.
+      dialled.abort();
+      if (generation == _generation) {
+        _onConnectionLost(Disconnected(error: error, stackTrace: stackTrace));
+      }
+      return;
+    }
+
+    if (generation != _generation) {
+      // Abandoned while dialling (disconnect(), connect()): don't keep it open.
+      dialled.abort();
+      return;
+    }
+
+    _channelSubscription = channel.stream.listen(
+      (message) {
+        if (generation == _generation) _onMessageReceived(message);
+      },
+      onError: (error) {
+        if (generation == _generation) _onEvent('error', error);
+      },
+      onDone: () {
+        if (generation == _generation) {
+          _onConnectionLost(Disconnected(code: channel.closeCode, reason: channel.closeReason));
+        }
+      },
+    );
+
+    _setState(_reconnecting ? const Reconnected() : const Connected());
+  }
+
+  /// Closes the current connection or connection attempt, if any, and ignores
+  /// everything it does after.
+  void _closeConnection([int? code, String? reason]) {
+    _generation++;
+
+    final dialled = _dial;
+    _dial = null;
+    _channelSubscription?.cancel();
+    _channelSubscription = null;
+
+    _stopActivityTimer();
+    _healthyTimer?.cancel();
+    _healthyTimer = null;
+    _connected = false;
+    _socketId = null;
+
+    channelsCollection.forEach((channel) => channel.onConnectionClosed());
+
+    if (dialled != null) {
+      // A client may only send 1000 or 3000-4999; anything else would throw
+      // where nobody can catch it.
+      final validCode = code != null && (code == 1000 || (code >= 3000 && code <= 4999));
+      dialled.channel.sink.close(validCode ? code : null, validCode ? reason : null).catchError((_) {});
+      dialled.abort();
+    }
+  }
+
+  /// Updates the state, then tells the listeners. Timers are armed or stopped
+  /// before any listener runs, so a listener may call [connect] or
+  /// [disconnect]; callers check [_generation] afterwards.
+  void _setState(ConnectionState state) {
+    if (state == _connectionState) return;
+
+    options.log("CONNECTION_STATE_CHANGED", null, "the connection state changed from ${_stateName(_connectionState)} to ${_stateName(state)}");
     _connectionState = state;
 
     /// Check if the client is connected (fixed by @usmanabdulmajid)
     _connected = state is Connected || state is Reconnected;
 
+    switch (state) {
+      case Connected() || Reconnected():
+        _resetActivityCheck();
+      case Disconnected():
+        _stopActivityTimer();
+        _socketId = null;
+      default:
+    }
+
+    final generation = _generation;
     _onEvent("connection_state_changed", state);
+    if (generation != _generation) return;
 
     switch (state) {
       case Connecting():
         _onEvent('connecting', null);
-        break;
       case Connected():
         _onEvent('connected', null);
-        _resetActivityCheck();
-        _reconnectionAttempts = 0;
-        break;
       case Reconnecting():
         _onEvent('reconnecting', null);
-        break;
       case Reconnected():
         _onEvent('reconnected', null);
-        _resetActivityCheck();
-        _reconnectionAttempts = 0;
-        break;
       case Disconnecting():
         _onEvent('disconnecting', null);
-        break;
       case Disconnected():
         _onEvent('disconnected', state);
-        if (state.error != null) {
+        if (state.error != null && generation == _generation) {
           _onEvent("connection_error", state.error);
         }
-        _stopActivityTimer();
-        _connected = false;
-        _socketId = null;
-        break;
-      default:
     }
   }
 
-  void _onConnectionError(dynamic error) {
-    options.log("CONNECTION_ERROR", null, "error: $error");
+  static String _stateName(ConnectionState state) => switch (state) {
+        Connecting() => 'CONNECTING',
+        Connected() => 'CONNECTED',
+        Reconnecting() => 'RECONNECTING',
+        Reconnected() => 'RECONNECTED',
+        Disconnecting() => 'DISCONNECTING',
+        Disconnected() => 'DISCONNECTED',
+      };
 
-    disconnect(1006, error.message);
+  /// The current connection was lost, or couldn't be established.
+  void _onConnectionLost(Disconnected state) {
+    _closeConnection();
+    final generation = _generation;
+    _setState(state);
+    // A listener connected or disconnected meanwhile: that wins.
+    if (generation != _generation || !_keepConnected) return;
 
-    if (error is SocketException) {
-      _reconnect();
+    final action = closeActionFor(state.code);
+    if (action == PusherCloseAction.doNotReconnect) {
+      options.log("CONNECTION_REFUSED", null, "code: ${state.code}\n  reason: ${state.reason}\n  not reconnecting");
+      _keepConnected = false;
+      return;
     }
+
+    _scheduleReconnect(action);
   }
 
-  int _reconnectionAttempts = 0;
-  void _reconnect() async {
-    if (_reconnectionAttempts < options.maxReconnectionAttempts) {
-      _reconnectionAttempts++;
-      await Future.delayed(options.reconnectGap);
-      connect();
-    } else {
-      disconnect(null, "Max reconnection attempts reached");
+  /// Dials again after a backoff delay.
+  void _scheduleReconnect(PusherCloseAction action) {
+    _cancelReconnect();
+
+    final maxAttempts = options.maxReconnectionAttempts;
+    if (maxAttempts != null && _reconnectionAttempts >= maxAttempts) {
+      _keepConnected = false;
+      _setState(const Disconnected(reason: "Max reconnection attempts reached"));
+      return;
     }
+
+    _reconnectionAttempts++;
+    final delay = _backoff.next(minAttempt: action == PusherCloseAction.reconnectWithBackoff ? 1 : 0);
+    options.log("RECONNECT", null, "attempt: $_reconnectionAttempts\n  delay: ${delay.inMilliseconds}ms");
+
+    _reconnecting = true;
+    _reconnectTimer = Timer(delay, () {
+      _reconnectTimer = null;
+      if (_keepConnected) _openConnection();
+    });
+    _setState(const Reconnecting());
+  }
+
+  void _cancelReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
   }
 
   void _onConnectionEstablished(Map data) {
     options.log("CONNECTION_ESTABLISHED", null, "data: $data");
     _socketId = data['socket_id'];
     _connected = true;
+
+    _healthyTimer?.cancel();
+    _healthyTimer = Timer(healthyConnectionAfter, () {
+      _healthyTimer = null;
+      _reconnectionAttempts = 0;
+      _backoff.reset();
+    });
+
+    final reestablished = _establishedSinceConnect;
+    _establishedSinceConnect = true;
+
+    final generation = _generation;
     _reSubscribe();
+    if (reestablished && generation == _generation) _onEvent("connection_reestablished", data);
+  }
+
+  /// A server `pusher:error` without a channel. Sockudo reports a rejected
+  /// subscribe (e.g. an invalid auth signature) that way, so the channels
+  /// waiting for the server's answer count it as theirs and retry.
+  void _onServerError(dynamic data) {
+    if (data is! Map) return; // e.g. the client's own "Activity timeout"
+    channelsCollection.forEach((channel) => channel.onServerError(data));
   }
 
   void _onPing(data) {
@@ -164,24 +363,34 @@ class PusherClient {
 
   Timer? _activityTimer;
 
+  bool _awaitingPong = false;
+
   void _sendActivityCheck() {
     _stopActivityTimer();
 
+    _awaitingPong = true;
+    _activityTimer = Timer(Duration(milliseconds: options.pongTimeout), _onActivityTimeout);
     sendEvent("pusher:ping", null);
+  }
 
-    _activityTimer = Timer.periodic(Duration(milliseconds: options.pongTimeout), (timer) {
-      _onEvent("pusher:error", "Activity timeout");
-      disconnect(null, "Activity timeout");
-    });
+  /// The server didn't answer our ping: the connection is dead, even if the
+  /// socket doesn't know it yet. Drop it and connect again.
+  void _onActivityTimeout() {
+    _awaitingPong = false;
+    final generation = _generation;
+    _onEvent("pusher:error", "Activity timeout");
+    if (generation == _generation) _onConnectionLost(const Disconnected(reason: "Activity timeout"));
   }
 
   void _resetActivityCheck() {
     _stopActivityTimer();
-    _activityTimer = Timer.periodic(Duration(milliseconds: options.activityTimeout), (timer) => _sendActivityCheck());
+    _activityTimer = Timer(Duration(milliseconds: options.activityTimeout), _sendActivityCheck);
   }
 
   void _stopActivityTimer() {
+    _awaitingPong = false;
     _activityTimer?.cancel();
+    _activityTimer = null;
   }
 
   final _eventsListeners = EventsListenersCollection();
@@ -232,10 +441,16 @@ class PusherClient {
     _eventsListeners.bind(event, listener);
   }
 
-  /// Send an event to the server.
+  /// Send an event to the server. Dropped while the client has no connection.
   void sendEvent(String event, [dynamic data, String? channel]) {
     options.log("SEND_EVENT", null, "event: $event\n  data: $data");
-    _socket.send(jsonEncode({"event": event, "data": data, if (channel != null) "channel": channel}));
+    final dialled = _dial;
+    if (!_connected || dialled == null) return;
+    try {
+      dialled.channel.sink.add(jsonEncode({"event": event, "data": data, if (channel != null) "channel": channel}));
+    } on StateError {
+      // The connection is closing; its loss is handled where it is detected.
+    }
   }
 
   /// Binding to the connection state change event.
@@ -255,6 +470,11 @@ class PusherClient {
 
   /// Binding to the connection state change event.
   void onReconnected(Function listener) => bind('reconnected', listener);
+
+  /// Binding to every `pusher:connection_established` after the first one
+  /// since [connect]: the client reconnected by itself, and events sent while
+  /// it was away were missed (refetch what they would have updated).
+  void onConnectionReestablished(Function listener) => bind('connection_reestablished', listener);
 
   /// Binding to the connection state change event.
   void onDisconnecting(Function listener) => bind('disconnecting', listener);
