@@ -71,12 +71,15 @@
 
 - Upgrade flutter sdk version.
 
-## 0.0.6 - 2026-11-22
+## 0.1.0 - 2026-11-22
 
 - Never stop reconnecting unless `disconnect()` was called: after a connection error (not only a `SocketException`, also an HTTP 502/503 on the upgrade), a lost connection and the client's own activity timeout.
 - The client dials the WebSocket itself (web_socket_channel) instead of relying on web_socket_client's reconnect: one connection at a time, and a connection attempt abandoned by `disconnect()`/`connect()` is closed as soon as it completes.
 - Follow the Pusher close codes: 4000-4099 stop reconnecting, 4100-4199 reconnect after at least `minReconnectDelay`, any other code reconnects after a short random delay (no thundering herd after a deploy's 4200).
 - Reconnect with a capped, jittered exponential backoff: add `minReconnectDelay` (default 1 s), `maxReconnectDelay` (default 30 s) and `connectTimeout` (default 30 s). The backoff only starts over once a connection stayed up for 10 s, so a server that accepts and closes connections can't cause a reconnect loop. `reconnectGap` is deprecated and ignored; `maxReconnectionAttempts` defaults to `null` (never give up).
 - Private channels: a failed auth (HTTP error, network error, exception from the auth headers) or a `pusher:subscription_error` is retried with a backoff while the connection lasts; add `onSubscriptionError`. A channel is authorized once per connection even when subscribed again while its subscription is pending.
+- Private channels also retry a subscribe the server never answers (`subscriptionTimeout`, default 20 s) or refuses with a `pusher:error` that names no channel (as Sockudo does); the retry backoff starts over on every connection; after three 401/403 in a row they retry only every `rejectedAuthRetryDelay` (default 5 min), with the HTTP status in `onSubscriptionError`. A lost connection marks channels unsubscribed.
+- Add `reconnectNow()` (reconnect at once while waiting to reconnect, or ping now while connected) and `onConnectionReestablished` (every `pusher:connection_established` after the first since `connect()`).
+- Listener code can't break the client: a listener that throws doesn't stop the others or reconnection (its error goes to the zone), and `connect()`/`disconnect()` from a listener are safe. On dart:io a connection attempt that times out is closed, also while its TCP connection or upgrade is still pending.
 - `disconnect()` and `sendEvent()` no longer throw when the client has no connection.
 - Fix `PusherOptions.uri` recursing forever for a host with an explicit port (or no host).

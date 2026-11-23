@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:meta/meta.dart';
 
@@ -107,20 +108,41 @@ class Channel {
     maxDelay: options.maxReconnectDelay,
   );
 
+  /// The connection the retry backoff counts for: it starts over on a new one.
+  String? _subscribeRetrySocketId;
+
+  /// Auth requests refused in a row with 401/403.
+  int _authRejections = 0;
+
+  /// After this many 401/403 in a row, retry only every
+  /// [PusherOptions.rejectedAuthRetryDelay].
+  static const int _authRejectionsBeforeLongDelay = 3;
+
   void _onSubscriptionSucceeded(dynamic data) {
     cancelSubscribeRetry();
     _subscribeRetryBackoff.reset();
+    _authRejections = 0;
   }
 
   void _onSubscriptionError(dynamic data) {
     options.log("SUBSCRIPTION_ERROR", name, "data: $data");
+
+    final status = data is Map ? data["status"] : null;
+    if (status == 401 || status == 403) {
+      _authRejections++;
+    } else {
+      _authRejections = 0;
+    }
 
     _subscribed = false;
     _scheduleSubscribeRetry();
   }
 
   /// Subscribes again after a backoff delay, as long as the connection that
-  /// failed is still up and the channel still wanted.
+  /// failed is still up and the channel still wanted. Transient failures (5xx,
+  /// 429, network, auth headers) back off up to [PusherOptions.maxReconnectDelay];
+  /// an auth refused with 401/403 several times in a row only every
+  /// [PusherOptions.rejectedAuthRetryDelay].
   void _scheduleSubscribeRetry() {
     cancelSubscribeRetry();
 
@@ -128,7 +150,18 @@ class Channel {
     // Without a connection, the next one subscribes again anyway.
     if (!client.connected || socketId == null) return;
 
-    final delay = _subscribeRetryBackoff.next(minAttempt: 1);
+    if (_subscribeRetrySocketId != socketId) {
+      _subscribeRetrySocketId = socketId;
+      _subscribeRetryBackoff.reset();
+    }
+
+    final Duration delay;
+    if (_authRejections >= _authRejectionsBeforeLongDelay) {
+      final longMs = options.rejectedAuthRetryDelay.inMilliseconds;
+      delay = Duration(milliseconds: longMs ~/ 2 + _jitter.nextInt(longMs - longMs ~/ 2 + 1));
+    } else {
+      delay = _subscribeRetryBackoff.next(minAttempt: 1);
+    }
     options.log("SUBSCRIBE_RETRY", name, "delay: ${delay.inMilliseconds}ms");
 
     _subscribeRetryTimer = Timer(delay, () {
@@ -138,6 +171,19 @@ class Channel {
       }
     });
   }
+
+  static final _jitter = Random();
+
+  /// The connection was closed: the next one subscribes again. Called by the
+  /// client.
+  void onConnectionClosed() {
+    _subscribed = false;
+    cancelSubscribeRetry();
+  }
+
+  /// A server `pusher:error` that names no channel arrived (see
+  /// [PrivateChannel]). Called by the client.
+  void onServerError(Map data) {}
 
   /// Cancels a pending subscription retry.
   @protected

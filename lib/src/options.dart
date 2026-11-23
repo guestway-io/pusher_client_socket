@@ -70,6 +70,15 @@ class PusherOptions {
   /// (default: 30 seconds).
   final Duration connectTimeout;
 
+  /// How long a private channel waits for the server's answer to its
+  /// subscribe before it tries again (default: 20 seconds).
+  final Duration subscriptionTimeout;
+
+  /// How often a private channel retries once its auth request was refused
+  /// with 401/403 several times in a row (default: 5 minutes). Other failures
+  /// are retried with the reconnection backoff.
+  final Duration rejectedAuthRetryDelay;
+
   /// The channel decryption handler.
   final Map<String, dynamic> Function(
     Uint8List sharedSecret,
@@ -99,6 +108,8 @@ class PusherOptions {
     this.minReconnectDelay = const Duration(seconds: 1),
     this.maxReconnectDelay = const Duration(seconds: 30),
     this.connectTimeout = const Duration(seconds: 30),
+    this.subscriptionTimeout = const Duration(seconds: 20),
+    this.rejectedAuthRetryDelay = const Duration(minutes: 5),
     this.channelDecryption,
   });
 

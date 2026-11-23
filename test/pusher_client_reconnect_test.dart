@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 
@@ -41,6 +42,13 @@ class FakePusherServer {
 
   /// Answers this many `pusher:subscribe` with `pusher:subscription_error`.
   int subscriptionErrorsLeft = 0;
+
+  /// Answers this many `pusher:subscribe` with a `pusher:error` that names no
+  /// channel, as Sockudo does for a refused subscribe.
+  int serverErrorsLeft = 0;
+
+  /// Doesn't answer this many `pusher:subscribe` at all.
+  int unansweredSubscribesLeft = 0;
 
   final List<io.WebSocket> sockets = [];
   final List<Map<String, dynamic>> received = [];
@@ -100,7 +108,12 @@ class FakePusherServer {
         }
         if (event['event'] == 'pusher:subscribe') {
           final channel = event['data']['channel'];
-          if (subscriptionErrorsLeft > 0) {
+          if (unansweredSubscribesLeft > 0) {
+            unansweredSubscribesLeft--;
+          } else if (serverErrorsLeft > 0) {
+            serverErrorsLeft--;
+            _send(socket, {'event': 'pusher:error', 'data': {'code': 4009, 'message': 'Invalid signature'}});
+          } else if (subscriptionErrorsLeft > 0) {
             subscriptionErrorsLeft--;
             _send(socket, {'event': 'pusher:subscription_error', 'channel': channel, 'data': jsonEncode({'type': 'AuthError', 'status': 401})});
           } else {
@@ -159,13 +172,20 @@ void main() {
     Duration minReconnectDelay = const Duration(milliseconds: 10),
     Duration? maxReconnectDelay,
     Duration healthyConnectionAfter = const Duration(seconds: 10),
+    Duration subscriptionTimeout = const Duration(seconds: 20),
+    Duration rejectedAuthRetryDelay = const Duration(minutes: 5),
+    Duration connectTimeout = const Duration(seconds: 30),
+    String? host,
     Future<Map<String, String>> Function()? authHeaders,
   }) {
     final c = PusherClient(
       options: PusherOptions(
         key: 'app-key',
-        host: server.host,
+        host: host ?? server.host,
         authOptions: PusherAuthOptions(server.authEndpoint, headersAsync: authHeaders),
+        subscriptionTimeout: subscriptionTimeout,
+        rejectedAuthRetryDelay: rejectedAuthRetryDelay,
+        connectTimeout: connectTimeout,
         autoConnect: false,
         activityTimeout: activityTimeout,
         pongTimeout: pongTimeout,
@@ -551,5 +571,251 @@ void main() {
       await wait(800);
       expect(server.authRequests, 1);
     });
+  });
+
+  group('private channel subscriptions', () {
+    const name = 'private-api.platform.v1.organizations.org.conversations';
+
+    test('retry a subscribe the server never answers', () async {
+      final client = makeClient(subscriptionTimeout: const Duration(milliseconds: 200))..connect();
+      await eventually(() => client.socketId != null);
+      server.unansweredSubscribesLeft = 1;
+      final errors = <dynamic>[];
+      final channel = client.private(name)..onSubscriptionError(errors.add);
+
+      channel.subscribe();
+
+      await eventually(() => channel.subscribed);
+      expect(server.subscribes(name), 2);
+      expect(errors, hasLength(1));
+    });
+
+    test('retry a subscribe refused with a pusher:error that names no channel (Sockudo)', () async {
+      final client = makeClient()..connect();
+      await eventually(() => client.socketId != null);
+      server.serverErrorsLeft = 1;
+
+      final channel = client.private(name, subscribe: true);
+
+      await eventually(() => channel.subscribed);
+      expect(server.subscribes(name), 2);
+      expect(server.authRequests, 2);
+    });
+
+    test('a pusher:error without channel leaves subscribed channels alone', () async {
+      final client = makeClient()..connect();
+      await eventually(() => client.socketId != null);
+      final subscribedChannel = client.private('private-subscribed', subscribe: true);
+      await eventually(() => subscribedChannel.subscribed);
+      server.serverErrorsLeft = 1;
+
+      final refused = client.private(name, subscribe: true);
+      await eventually(() => refused.subscribed);
+
+      expect(server.subscribes('private-subscribed'), 1);
+    });
+
+    test('back off afresh on a new connection', () async {
+      final client = makeClient(minReconnectDelay: const Duration(milliseconds: 50), maxReconnectDelay: const Duration(seconds: 3))..connect();
+      await eventually(() => client.socketId != null);
+      server.authFailuresLeft = 5;
+      client.private(name, subscribe: true);
+      await eventually(() => server.authRequests == 5, timeout: const Duration(seconds: 15));
+
+      // The retry backoff is now at several seconds. A new connection starts over.
+      server.authFailuresLeft = 1;
+      await server.closeLatest(4200);
+      final closedAt = DateTime.now();
+      await eventually(() => client.channel(name).subscribed, timeout: const Duration(seconds: 15));
+
+      expect(server.authRequests, 7);
+      expect(DateTime.now().difference(closedAt), lessThan(const Duration(seconds: 1)));
+    });
+
+    test('after repeated 401/403, retry only every rejectedAuthRetryDelay and tell the app', () async {
+      final client = makeClient(rejectedAuthRetryDelay: const Duration(seconds: 1))..connect();
+      await eventually(() => client.socketId != null);
+      server.authFailureStatus = 403;
+      server.authFailuresLeft = 4;
+      final errors = <dynamic>[];
+      final channel = client.private(name)..onSubscriptionError(errors.add);
+
+      channel.subscribe();
+
+      await eventually(() => server.authRequests == 3);
+      await wait(400);
+      expect(server.authRequests, 3);
+      expect(errors.map((e) => e['status']), [403, 403, 403]);
+
+      await eventually(() => server.authRequests == 4);
+      await eventually(() => server.authRequests == 5 && channel.subscribed);
+    });
+
+    test('a lost connection marks channels unsubscribed until subscribed again', () async {
+      final client = makeClient(minReconnectDelay: const Duration(milliseconds: 300))..connect();
+      await eventually(() => client.socketId != null);
+      final channel = client.private(name, subscribe: true);
+      await eventually(() => channel.subscribed);
+
+      await server.closeLatest(4200);
+      await eventually(() => !client.connected);
+      expect(channel.subscribed, isFalse);
+
+      await eventually(() => channel.subscribed);
+      expect(server.subscribes(name), 2);
+    });
+  });
+
+  group('listeners', () {
+    test('connect() from onDisconnected leaves one connection, and none after disconnect()', () async {
+      final client = makeClient(minReconnectDelay: const Duration(milliseconds: 200));
+      var once = true;
+      client.onDisconnected((_) {
+        if (once) {
+          once = false;
+          client.connect();
+        }
+      });
+      client.connect();
+      await eventually(() => server.established == 1);
+
+      await server.closeLatest(4200);
+      await eventually(() => server.established == 2);
+      await wait(800);
+      expect(server.upgradeRequests, 2);
+      expect(server.open, 1);
+
+      client.disconnect();
+      await wait(200);
+      expect(server.open, 0);
+    });
+
+    test('a listener that throws does not stop reconnecting; its error goes to the zone', () async {
+      final uncaught = <Object>[];
+      await runZonedGuarded(() async {
+        final client = makeClient();
+        var once = true;
+        client.onDisconnected((_) {
+          if (once) {
+            once = false;
+            throw StateError('listener bug');
+          }
+        });
+        client.connect();
+        await eventually(() => server.established == 1);
+
+        await server.closeLatest(4200);
+
+        await eventually(() => server.established == 2 && client.connected);
+      }, (error, stackTrace) => uncaught.add(error));
+      expect(uncaught, [isA<StateError>()]);
+    });
+
+    test('connect() from onConnecting leaves one working connection', () async {
+      final uncaught = <Object>[];
+      await runZonedGuarded(() async {
+        final client = makeClient();
+        var once = true;
+        client.onConnecting((_) {
+          if (once) {
+            once = false;
+            client.connect();
+          }
+        });
+        client.connect();
+        await eventually(() => client.socketId != null);
+        client.subscribe('public-chan');
+        client.sendEvent('pusher:ping');
+
+        await eventually(() => server.subscribes('public-chan') == 1 && server.received.any((e) => e['event'] == 'pusher:ping'));
+        await wait(300);
+        expect(server.open, 1);
+      }, (error, stackTrace) => uncaught.add(error));
+      expect(uncaught, isEmpty);
+    });
+  });
+
+  group('connectTimeout', () {
+    test('gives up on a server that never answers the upgrade, and closes the attempt', () async {
+      final tcp = await io.ServerSocket.bind(io.InternetAddress.loopbackIPv4, 0);
+      final open = <io.Socket>{};
+      tcp.listen((socket) {
+        open.add(socket);
+        socket.listen((_) {}, onDone: () => open.remove(socket), onError: (_) => open.remove(socket));
+      });
+      final states = <ConnectionState>[];
+      final client = makeClient(
+        host: 'ws://127.0.0.1:${tcp.port}',
+        connectTimeout: const Duration(milliseconds: 200),
+        minReconnectDelay: const Duration(milliseconds: 50),
+      );
+      client.onConnectionStateChange(states.add);
+      client.connect();
+
+      await wait(1500);
+      expect(states.whereType<Disconnected>().length, greaterThanOrEqualTo(3));
+      expect(states.whereType<Disconnected>().first.error, isA<TimeoutException>());
+      // At most the attempt in flight is open.
+      expect(open.length, lessThanOrEqualTo(1));
+
+      client.disconnect();
+      await wait(200);
+      expect(open, isEmpty);
+      for (final socket in open.toList()) {
+        socket.destroy();
+      }
+      await tcp.close();
+    });
+  });
+
+  group('reconnectNow()', () {
+    test('reconnects right away while waiting to reconnect', () async {
+      final client = makeClient(minReconnectDelay: const Duration(seconds: 10))..connect();
+      await eventually(() => client.socketId != null);
+      await server.closeLatest(4100); // waits at least minReconnectDelay
+      await eventually(() => client.connectionState is Reconnecting);
+
+      client.reconnectNow();
+
+      await eventually(() => server.established == 2 && client.connected, timeout: const Duration(seconds: 2));
+    });
+
+    test('pings a connected server, and reconnects when no pong comes', () async {
+      final client = makeClient(pongTimeout: 200)..connect();
+      await eventually(() => client.socketId != null);
+
+      client.reconnectNow();
+      await eventually(() => server.received.where((e) => e['event'] == 'pusher:ping').length == 1);
+      await wait(400);
+      expect(server.established, 1);
+
+      server.answerPings = false;
+      client.reconnectNow();
+      await eventually(() => server.established == 2);
+    });
+
+    test('does nothing after disconnect()', () async {
+      final client = makeClient()..connect();
+      await eventually(() => client.socketId != null);
+      client.disconnect();
+
+      client.reconnectNow();
+      await wait(300);
+      expect(server.upgradeRequests, 1);
+    });
+  });
+
+  test('onConnectionReestablished fires for every connection after the first', () async {
+    final client = makeClient();
+    final reestablished = <String?>[];
+    client.onConnectionReestablished((_) => reestablished.add(client.socketId));
+    client.connect();
+    await eventually(() => client.socketId != null);
+    await wait(100);
+    expect(reestablished, isEmpty);
+
+    await server.closeLatest(4200);
+    await eventually(() => reestablished.length == 1);
+    expect(reestablished, ['1.2']);
   });
 }
